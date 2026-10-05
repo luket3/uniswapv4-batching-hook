@@ -14,9 +14,10 @@ import {SafeCast} from "@uniswap/v4-core/src/libraries/SafeCast.sol";
 import {console} from "forge-std/console.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
-import {SwapSim} from "./SwapSim.sol";
-import {SettlementRouter} from "./SettlementRouter.sol";
+import {BalanceCalc} from "./BalanceCalc.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {SqrtPriceMath} from "v4-core/src/libraries/SqrtPriceMath.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 
 interface IMsgSender {
     function msgSender() external view returns (address);
@@ -40,12 +41,8 @@ contract BatchingHook is BaseHook, IUnlockCallback {
     struct BatchState {
         uint256 amountToken0;
         uint256 amountToken1;
-        uint160 clearingPriceX96;
         uint160 upperSqrtClearingPriceX96;
         uint160 lowerSqrtClearingPriceX96;
-        uint256 setRoutStake;
-        bool setRoutStakeZeroForOne;
-        bool locked;
         SwapTransaction[] transactions;
     }
 
@@ -57,14 +54,10 @@ contract BatchingHook is BaseHook, IUnlockCallback {
     // trusted routers
     mapping(address swapRouter => bool approved) public verifiedRouters;
 
-    SettlementRouter public settlementRouter;
+    bool allowSwap;
 
-    constructor(IPoolManager _poolManager, SettlementRouter _settlementRouter) BaseHook(_poolManager) {
-        settlementRouter = _settlementRouter;
-    }
-
-    function setSettlementRouter(address _settlementRouter) external {
-        settlementRouter = SettlementRouter(_settlementRouter);
+    constructor(IPoolManager _poolManager) BaseHook(_poolManager) {
+        allowSwap = false;
     }
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
@@ -76,11 +69,11 @@ contract BatchingHook is BaseHook, IUnlockCallback {
             beforeRemoveLiquidity: false,
             afterRemoveLiquidity: false,
             beforeSwap: true,
-            afterSwap: true,
+            afterSwap: false,
             beforeDonate: false,
             afterDonate: false,
             beforeSwapReturnDelta: true,
-            afterSwapReturnDelta: true,
+            afterSwapReturnDelta: false,
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
         });
@@ -98,33 +91,24 @@ contract BatchingHook is BaseHook, IUnlockCallback {
         return abi.encode(user);
     }
 
-    function _isSettlementSwap(bytes calldata hookData) internal view returns (bool) {
-        return hookData.length == 32
-            && abi.decode(hookData, (address)) == address(settlementRouter);
-    }
-
     function _checkValidTransaction(
         BatchState storage batchState, 
-        PoolId poolId,
         bool zeroForOne,
         uint160 sqrtPriceLimitX96
     ) internal returns (bool) {
         if (batchState.transactions.length == 0) {
-            (batchState.clearingPriceX96,,,) = poolManager.getSlot0(poolId);
-            batchState.upperSqrtClearingPriceX96 = type(uint160).max;
-            batchState.lowerSqrtClearingPriceX96 = 0;
+            batchState.upperSqrtClearingPriceX96 = TickMath.MAX_SQRT_PRICE;
+            batchState.lowerSqrtClearingPriceX96 = TickMath.MIN_SQRT_PRICE;
         } 
 
         if (zeroForOne) {
-            if (sqrtPriceLimitX96 > batchState.clearingPriceX96) return false;
-
+            if (sqrtPriceLimitX96 > batchState.upperSqrtClearingPriceX96) return false;
             if (sqrtPriceLimitX96 > batchState.lowerSqrtClearingPriceX96) {
                 batchState.lowerSqrtClearingPriceX96 = sqrtPriceLimitX96;
             }
         } else {
-            if (sqrtPriceLimitX96 < batchState.clearingPriceX96) return false;
-
-            if (sqrtPriceLimitX96 < batchState.upperSqrtClearingPriceX96) {
+            if (sqrtPriceLimitX96 < batchState.lowerSqrtClearingPriceX96) return false;
+            if (sqrtPriceLimitX96 < batchState.upperSqrtClearingPriceX96 && sqrtPriceLimitX96 != 0) {
                 batchState.upperSqrtClearingPriceX96 = sqrtPriceLimitX96;
             }
         }
@@ -157,21 +141,18 @@ contract BatchingHook is BaseHook, IUnlockCallback {
         address sender, 
         PoolKey calldata key, 
         SwapParams calldata params, 
-        bytes calldata hookData
+        bytes calldata
     ) internal override returns (bytes4, BeforeSwapDelta, uint24)
     {
         PoolId poolId = key.toId();
         BatchState storage batchState = batchStates[poolId];
-        if (batchState.locked) {
-            revert("pool is currently not accepting orders");
-        } else if (_isSettlementSwap(hookData)) {
+        if (allowSwap) {
             if (params.amountSpecified >= 0) revert("settlement swap must be exact-input");
             return (BaseHook.beforeSwap.selector, toBeforeSwapDelta(0, 0), 0);
         } else if (params.amountSpecified < 0) {
             // AsyncSwap only works on exact-input swaps
             if (!_checkValidTransaction(
                     batchState, 
-                    poolId, 
                     params.zeroForOne, 
                     params.sqrtPriceLimitX96)) {
                 revert("BatchingHook: Invalid transaction for current batch");
@@ -194,7 +175,7 @@ contract BatchingHook is BaseHook, IUnlockCallback {
             // update the batch state with the new transaction
             _updateBatchState(
                 batchState,
-                params.zeroForOne, 
+                params.zeroForOne,
                 amountTaken,
                 params.amountSpecified,
                 user
@@ -208,151 +189,159 @@ contract BatchingHook is BaseHook, IUnlockCallback {
 
     }
 
-    function lockPool(PoolId poolId) external {
-        batchStates[poolId].locked = true;
+    function _callBalanceCalc(
+        PoolKey memory key,
+		uint256 amountIn0,
+		uint256 amountIn1,
+		uint160 sqrtPriceUpperX96,
+		uint160 sqrtPriceLowerX96
+    ) external view returns (uint256 amount, bool zeroForOne) {
+        if (msg.sender != address(this)) revert OnlySelf();
+        return BalanceCalc.getAmountToBalance(poolManager, key, amountIn0, amountIn1, sqrtPriceUpperX96, sqrtPriceLowerX96);
     }
 
-    function unlockPool(PoolId poolId) internal {
-        batchStates[poolId].locked = false;
+    function _getAmountToBalance(
+        PoolKey memory key,
+		uint256 amountIn0,
+		uint256 amountIn1,
+		uint160 sqrtPriceUpperX96,
+		uint160 sqrtPriceLowerX96
+    ) internal view returns(uint256 amount, bool zeroForOne, bool valid) { 
+        try this._callBalanceCalc(key, amountIn0, amountIn1, sqrtPriceUpperX96, sqrtPriceLowerX96)
+            returns (uint256 _amount, bool _zeroForOne)
+        {
+            return (_amount, _zeroForOne, true);
+        } catch {
+            return (0, false, false);
+        }
     }
 
-    function _revertBatch(SwapTransaction[] memory transactions, PoolKey memory key) internal {
+    function _calculateSwap(
+        uint160 sqrtPriceUpperX96, 
+        uint160 sqrtPriceLowerX96,
+        uint256 amount0,
+        uint256 amount1,
+        PoolKey memory key
+    ) internal view returns (uint256 amount, uint160 sqrtPriceLimitX96, bool zeroForOne, bool valid) {
+        (amount, zeroForOne, valid) = _getAmountToBalance(
+            key, amount0, amount1, sqrtPriceUpperX96, sqrtPriceLowerX96
+        );
+
+        if (!valid) {
+            return (0, 0, false, false);
+        }
+        sqrtPriceLimitX96 = zeroForOne 
+            ? sqrtPriceLowerX96 
+            : sqrtPriceUpperX96;
+    }
+
+    function _resolveSwapDelta(BalanceDelta delta, PoolKey memory key) internal {
+        _resolveCurrencyDelta(key.currency0, BalanceDeltaLibrary.amount0(delta));
+        _resolveCurrencyDelta(key.currency1, BalanceDeltaLibrary.amount1(delta));
+    }
+
+    function _resolveCurrencyDelta(Currency currency, int128 delta) private {
+        if (delta < 0) {
+            poolManager.burn(address(this), currency.toId(), uint256(-int256(delta)));
+        } else if (delta > 0) {
+            poolManager.mint(address(this), currency.toId(), uint256(uint128(delta)));
+        }
+    }
+
+    function _clearTransactions(
+        SwapTransaction[] storage transactions, 
+        uint256 amountToken0,
+        uint256 amountToken1,
+        PoolKey memory key) internal {
+        uint256 totalOutput0 = poolManager.balanceOf(address(this), key.currency0.toId());
+        uint256 totalOutput1 = poolManager.balanceOf(address(this), key.currency1.toId());
+
         for (uint256 i = 0; i < transactions.length; i++) {
             SwapTransaction memory swapTransaction = transactions[i];
-            Currency input = swapTransaction.zeroForOne ? key.currency0 : key.currency1;
-            poolManager.burn(swapTransaction.receiver, input.toId(), uint256(-swapTransaction.amountSpecified));
+            uint256 amountIn = uint256(-swapTransaction.amountSpecified);
+            uint256 outputAmount;
+            if (swapTransaction.zeroForOne) {
+                outputAmount = FullMath.mulDiv(amountIn, totalOutput1, amountToken0);
+                _burnClaimAndTake(key.currency1, swapTransaction.receiver, outputAmount);
+            } else {
+                outputAmount = FullMath.mulDiv(amountIn, totalOutput0, amountToken1);
+                _burnClaimAndTake(key.currency0, swapTransaction.receiver, outputAmount);
+            }
         }
+    }
 
+    function _revertBatch(
+        SwapTransaction[] memory transactions,
+        PoolKey memory key
+    ) internal {
+        for (uint256 i = 0; i < transactions.length; i++) {
+            SwapTransaction memory swapTransaction = transactions[i];
+            uint256 amountIn = uint256(-swapTransaction.amountSpecified);
+            Currency input = swapTransaction.zeroForOne ? key.currency0 : key.currency1;
+            _burnClaimAndTake(input, swapTransaction.receiver, amountIn);
+        }
+    }
+
+    function _burnClaimAndTake(Currency currency, address recipient, uint256 amount) private {
+        if (amount == 0) return;
+        poolManager.burn(address(this), currency.toId(), amount);
+        poolManager.take(currency, recipient, amount);
     }
 
     function unlockCallback(
         bytes calldata data
-    ) external returns (bytes memory) {
+    ) external override returns (bytes memory) {
         require(msg.sender == address(poolManager));
-        (SwapTransaction[] memory transactions, PoolKey memory key) = abi.decode(data, (SwapTransaction[], PoolKey));
-        _revertBatch(transactions, key);
-        return "";
-    }
 
-    function revertBatch(PoolKey calldata key) external {
-        PoolId poolId = key.toId();
-        bytes memory data = abi.encode(batchStates[key.toId()].transactions, key);
-
-        poolManager.unlock(data);
-        delete batchStates[key.toId()];
-        unlockPool(poolId);
-    }
-
-    function _calculateSwap(
-        uint160 _sqrtPriceLimitX96, 
-        uint256 _amountToken0,
-        uint256 _amountToken1
-    ) internal pure returns (uint256 amount, bool zeroForOne) {
-        uint256 priceX128 = FullMath.mulDiv(
-            _sqrtPriceLimitX96,
-            _sqrtPriceLimitX96,
-            1 << 64
-        );
-        uint256 amountZeroForOne = FullMath.mulDiv(
-            _amountToken0,
-            priceX128,
-            1 << 128
-        );
-
-        // Excess token0
-        if (amountZeroForOne > _amountToken1) {
-            uint256 numerator = amountZeroForOne - _amountToken1;
-            amount = FullMath.mulDiv(
-                numerator,
-                1 << 127,
-                priceX128
-            );
-            zeroForOne = true;
-        // Excess token1
-        } else if (amountZeroForOne < _amountToken1) {
-            uint256 numerator = _amountToken1 - amountZeroForOne;
-            amount = numerator / 2;
-            zeroForOne = false;
-        // Already exactly at the target price
-        } else {
-            amount = 0;
-            zeroForOne = false;
-        }
-    }
-
-    function clearTransactions(
-        SwapTransaction[] storage transactions, 
-        uint256 amountToken0,
-        uint256 amountToken1,
-        PoolKey calldata key) internal {
-        while (transactions.length > 0) {
-            SwapTransaction memory swapTransaction = transactions[transactions.length - 1];
-            Currency input;
-            uint256 outputAmount;
-            if (swapTransaction.zeroForOne) {
-                input = key.currency1;
-                outputAmount = FullMath.mulDiv(
-                    uint256(-swapTransaction.amountSpecified),
-                    amountToken1,
-                    amountToken0
-                );
-            } else {
-                input = key.currency0;
-                outputAmount = FullMath.mulDiv(
-                    uint256(-swapTransaction.amountSpecified),
-                    amountToken0,
-                    amountToken1
-                );
-            }
-            poolManager.burn(swapTransaction.receiver, input.toId(), uint256(-swapTransaction.amountSpecified));
-            transactions.pop();
-        }
-    }
-
-    function _afterSwap(
-        address,
-        PoolKey calldata key, 
-        SwapParams calldata params,
-        BalanceDelta swapDelta,
-        bytes calldata hookData
-    ) internal override returns (bytes4 selector, int128 amountOut)
-    {
-        // ready batch to be cleared
-        PoolId poolId = key.toId();
+        (PoolKey memory pk) = abi.decode(data, (PoolKey));
+        PoolId poolId = pk.toId();
         BatchState storage batchState = batchStates[poolId];
-        if (_isSettlementSwap(hookData) && batchState.transactions.length != 0) {
-            int128 _amountOut = params.zeroForOne
-                ? BalanceDeltaLibrary.amount1(swapDelta)
-                : BalanceDeltaLibrary.amount0(swapDelta);
-            if (_amountOut <= 0) return (BaseHook.afterSwap.selector, 0);
+        (uint256 _amount, uint160 _sqrtPriceLimitX96, bool _zeroForOne, bool _valid) = _calculateSwap(
+            batchState.upperSqrtClearingPriceX96,
+            batchState.lowerSqrtClearingPriceX96,
+            batchState.amountToken0,
+            batchState.amountToken1,
+            pk
+        );
 
-            Currency outputCurrency = params.zeroForOne ? key.currency1 : key.currency0;
-            poolManager.mint(address(this), outputCurrency.toId(), uint256(uint128(_amountOut)));
-            clearTransactions(
+        if (_valid) {
+            allowSwap = true;
+            BalanceDelta delta = poolManager.swap(
+            pk,
+            SwapParams({
+                zeroForOne: _zeroForOne,
+                amountSpecified: -int256(_amount),
+                sqrtPriceLimitX96: _sqrtPriceLimitX96
+            }),
+            "");
+            allowSwap = false;
+            _resolveSwapDelta(delta, pk);
+            _clearTransactions(
                 batchState.transactions,
-                batchState.amountToken0, 
-                batchState.amountToken1, 
-                key);
-
-            return (BaseHook.afterSwap.selector, _amountOut);
-        } else if (batchState.transactions.length >= BATCH_FREQUENCY) {
-            // give the settlement router the stake to clear the batch
-            (batchState.setRoutStake, batchState.setRoutStakeZeroForOne) = _calculateSwap(
-                batchState.clearingPriceX96,
                 batchState.amountToken0,
-                batchState.amountToken1
-            );
-            Currency outputCurrency = batchState.setRoutStakeZeroForOne ? key.currency1 : key.currency0;
-            poolManager.mint(address(settlementRouter), outputCurrency.toId(), uint256(batchState.setRoutStake));
-
-            settlementRouter.readyClear(
-                key,
-                batchState.setRoutStake,
-                batchState.setRoutStakeZeroForOne,
-                batchState.lowerSqrtClearingPriceX96,
-                batchState.upperSqrtClearingPriceX96
-            );
+                batchState.amountToken1,
+                pk);
+            
+            delete batchStates[poolId];
+            bytes memory rtnData = abi.encode(true);
+            return rtnData;
+        } else {
+            _revertBatch(batchState.transactions, pk);
+            delete batchStates[poolId];
+            bytes memory rtnData = abi.encode(false);
+            return rtnData;
         }
-        return (BaseHook.afterSwap.selector, 0);
+    }
+
+    function clearBatch(
+        PoolKey calldata key
+    ) external returns (bool) {
+        BatchState memory batchState = batchStates[key.toId()];
+        if (batchState.transactions.length <= 0) {
+            return false;
+        }
+
+        bytes memory output = poolManager.unlock(abi.encode(key));
+        return abi.decode(output, (bool));
     }
 }

@@ -18,7 +18,6 @@ import {Constants} from "@uniswap/v4-core/test/utils/Constants.sol";
 import {EasyPosm} from "./utils/libraries/EasyPosm.sol";
 
 import {BatchingHook} from "../src/BatchingHook.sol";
-import {SettlementRouter} from "../src/SettlementRouter.sol";
 
 import {BaseTest} from "./utils/BaseTest.sol";
 
@@ -31,7 +30,6 @@ contract PointsHookTest is BaseTest {
     using StateLibrary for IPoolManager;
 
     BatchingHook hook;
-    SettlementRouter settlementRouter;
     PoolId poolId;
     PoolKey key;
 
@@ -41,25 +39,22 @@ contract PointsHookTest is BaseTest {
     int24 tickLower;
     int24 tickUpper;
 
+    receive() external payable {}
+
     function setUp() public {
         deployArtifactsAndLabel();
 
         (, currency1) = deployCurrencyPair();
-        settlementRouter = new SettlementRouter(poolManager);
 
         // Deploy the hook to an address with the correct flags
         address flags = address(
             uint160(
-                Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
-                    | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+                Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
             ) ^ (0x4444 << 144) // Namespace the hook to avoid collisions
         );
         bytes memory constructorArgs = abi.encode(poolManager);
         deployCodeTo("BatchingHook.sol:BatchingHook", constructorArgs, flags);
         hook = BatchingHook(flags);
-
-        settlementRouter.setBatchingHook(address(hook));
-        hook.setSettlementRouter(address(settlementRouter));
 
         // Create the pool
         key = PoolKey(
@@ -129,6 +124,9 @@ contract PointsHookTest is BaseTest {
     function test_outcome() public {
         // Perform a second swap //
 
+        uint256 balance0Before = Currency.wrap(address(0)).balanceOfSelf();
+        uint256 balance1Before = currency1.balanceOfSelf();
+
         int256 amountSpecified = -1e18;
         bool zeroForOne = true;
         swapRouter.swap{value: uint256(-amountSpecified)}({
@@ -150,5 +148,14 @@ contract PointsHookTest is BaseTest {
             receiver: address(this),
             deadline: block.timestamp + 1
         });
+        
+        hook.clearBatch(key);
+        uint256 balance0After = Currency.wrap(address(0)).balanceOfSelf();
+        uint256 balance1After = currency1.balanceOfSelf();
+
+        assertEq(balance0Before - balance0After, 1e18*2);
+
+        // user did not recieve token1 (AsyncSwap)
+        assert(balance1Before != balance1After);
     }
 }
