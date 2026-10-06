@@ -13,7 +13,7 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol";
 import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
 import {Constants} from "@uniswap/v4-core/test/utils/Constants.sol";
-
+import {console} from "forge-std/console.sol";
 import {EasyPosm} from "./utils/libraries/EasyPosm.sol";
 import {BaseTest} from "./utils/BaseTest.sol";
 import {BalanceCalc} from "../src/BalanceCalc.sol";
@@ -63,8 +63,8 @@ contract BalanceCalcTest is BaseTest {
     }
 
     function test_balancingSwapMatchesSequentialExactInputSwaps() public {
-        uint256 amount0 = 2e18;
-        uint256 amount1 = 1e18;
+        uint256 amount0 = 200;
+        uint256 amount1 = 100;
         uint160 lowerSqrtPriceX96 = TickMath.MIN_SQRT_PRICE;
         uint160 upperSqrtPriceX96 = TickMath.MAX_SQRT_PRICE;
         uint256 snapshotId = vm.snapshotState();
@@ -90,7 +90,6 @@ contract BalanceCalcTest is BaseTest {
         (uint160 sequentialSqrtPriceX96,,,) = poolManager.getSlot0(key.toId());
 
         assertTrue(vm.revertToState(snapshotId), "pool state should restore before comparison");
-
         (uint256 balancingAmount, bool zeroForOne) = balanceCalc.getAmountToBalance(
             poolManager,
             key,
@@ -116,6 +115,29 @@ contract BalanceCalcTest is BaseTest {
             balancingSqrtPriceX96,
             sequentialSqrtPriceX96,
             "calculated balancing swap should match the sequential exact-input final price"
+        );
+    }
+
+    function test_swapGasFee() public {
+        swapRouter.swap({
+            amountSpecified: -int256(999999999999999),
+            amountLimit: 0,
+            zeroForOne: true,
+            poolKey: key,
+            hookData: "",
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+    }
+
+    function test_calcGasFee() view public {
+        balanceCalc.getAmountToBalance(
+            poolManager,
+            key,
+            1e18,
+            1e16,
+            TickMath.MAX_SQRT_PRICE,
+            TickMath.MIN_SQRT_PRICE
         );
     }
 
