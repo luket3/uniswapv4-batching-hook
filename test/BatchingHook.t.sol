@@ -19,6 +19,10 @@ import {EasyPosm} from "./utils/libraries/EasyPosm.sol";
 import {BatchingHook} from "../src/BatchingHook.sol";
 import {BaseTest} from "./utils/BaseTest.sol";
 import {BalanceDelta, BalanceDeltaLibrary} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
+import {console} from "forge-std/console.sol";
+import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
+import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
+import {BalanceCalc} from "../src/BalanceCalc.sol";
 
 contract BatchingHookTest is BaseTest {
     using EasyPosm for IPositionManager;
@@ -29,16 +33,18 @@ contract BatchingHookTest is BaseTest {
     BatchingHook hook;
     PoolId poolId;
     PoolKey key;
+    Currency currency0;
     Currency currency1;
     uint256 tokenId;
     int24 tickLower;
     int24 tickUpper;
+    PoolSwapTest limitRouter;
 
     receive() external payable {}
 
     function setUp() public {
         deployArtifactsAndLabel();
-
+        currency0 = Currency.wrap(address(0));
         (, currency1) = deployCurrencyPair();
 
         // Deploy the hook to an address with the correct flags
@@ -53,7 +59,7 @@ contract BatchingHookTest is BaseTest {
 
         // Create the pool
         key = PoolKey(
-            Currency.wrap(address(0)),
+            currency0,
             currency1,
             3000,
             60,
@@ -85,6 +91,7 @@ contract BatchingHookTest is BaseTest {
             block.timestamp + 1,
             hook.getHookData(address(this))
         );
+        limitRouter = new PoolSwapTest(poolManager);
     }
 
     function test_asyncSwap() public {
@@ -107,15 +114,11 @@ contract BatchingHookTest is BaseTest {
         uint256 balance0After = Currency.wrap(address(0)).balanceOfSelf();
         uint256 balance1After = currency1.balanceOfSelf();
 
-        // user paid token0
         assertEq(balance0Before - balance0After, 1e18);
-
-        // user did not recieve token1 (AsyncSwap)
         assertEq(balance1Before, balance1After);
     }
 
-    function test_outcome() public {
-        // Perform a second swap //
+    function test_CurrencyRecOnClear() public {
         uint256 balance0Before = Currency.wrap(address(0)).balanceOfSelf();
         uint256 balance1Before = currency1.balanceOfSelf();
 
@@ -130,7 +133,6 @@ contract BatchingHookTest is BaseTest {
             receiver: address(this),
             deadline: block.timestamp + 1
         });
-
         swapRouter.swap{value: uint256(-amountSpecified)}({
             amountSpecified: amountSpecified,
             amountLimit: 0,
@@ -144,14 +146,24 @@ contract BatchingHookTest is BaseTest {
         hook.clearBatch(key);
         uint256 balance0After = Currency.wrap(address(0)).balanceOfSelf();
         uint256 balance1After = currency1.balanceOfSelf();
-
         assertEq(balance0Before - balance0After, 1e18*2);
-
-        // user did not recieve token1 (AsyncSwap)
         assert(balance1Before != balance1After);
     }
 
-    function test_ordersClearAtSamePrice() public {
+    function _swapExactInput(address trader, uint256 amountIn, bool zeroForOne) internal {
+        vm.prank(trader);
+        swapRouter.swap{value: zeroForOne ? amountIn : 0}({
+            amountSpecified: -int256(amountIn),
+            amountLimit: 0,
+            zeroForOne: zeroForOne,
+            poolKey: key,
+            hookData: hook.getHookData(trader),
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+    }
+
+    function test_sameDirSameClearPrice() public {
         address firstTrader = address(0xA11CE);
         address secondTrader = address(0xB0B);
         uint256 firstAmountIn = 1e18;
@@ -159,27 +171,8 @@ contract BatchingHookTest is BaseTest {
         vm.deal(firstTrader, firstAmountIn);
         vm.deal(secondTrader, secondAmountIn);
 
-        vm.prank(firstTrader);
-        swapRouter.swap{value: firstAmountIn}({
-            amountSpecified: -int256(firstAmountIn),
-            amountLimit: 0,
-            zeroForOne: true,
-            poolKey: key,
-            hookData: hook.getHookData(firstTrader),
-            receiver: firstTrader,
-            deadline: block.timestamp + 1
-        });
-
-        vm.prank(secondTrader);
-        swapRouter.swap{value: secondAmountIn}({
-            amountSpecified: -int256(secondAmountIn),
-            amountLimit: 0,
-            zeroForOne: true,
-            poolKey: key,
-            hookData: hook.getHookData(secondTrader),
-            receiver: secondTrader,
-            deadline: block.timestamp + 1
-        });
+        _swapExactInput(firstTrader, firstAmountIn, true);
+        _swapExactInput(secondTrader, secondAmountIn, true);
 
         assertTrue(hook.clearBatch(key), "batch should clear successfully");
 
@@ -196,7 +189,14 @@ contract BatchingHookTest is BaseTest {
         assertLe(productDifference, secondAmountIn, "orders should receive token1 at the same clearing price");
     }
 
-    function test_mixedDirectionOrdersClear() public {
+    function _assertSameRate(uint256 outputA, uint256 inputA, uint256 outputB, uint256 inputB) private pure {
+        uint256 productA = outputA * inputB;
+        uint256 productB = outputB * inputA;
+        uint256 difference = productA > productB ? productA - productB : productB - productA;
+        assertLe(difference, inputA + inputB, "same-direction orders should clear at the same price");
+    }
+
+    function test_mixDirSameClearPrice() public {
         address token0TraderA = address(0xA11CE);
         address token0TraderB = address(0xB0B);
         address token1TraderA = address(0xCAFE);
@@ -211,64 +211,22 @@ contract BatchingHookTest is BaseTest {
         vm.deal(token0TraderB, amountToken0B);
         token1.mint(token1TraderA, amountToken1A);
         token1.mint(token1TraderB, amountToken1B);
-
-        vm.prank(token0TraderA);
-        swapRouter.swap{value: amountToken0A}({
-            amountSpecified: -int256(amountToken0A),
-            amountLimit: 0,
-            zeroForOne: true,
-            poolKey: key,
-            hookData: hook.getHookData(token0TraderA),
-            receiver: token0TraderA,
-            deadline: block.timestamp + 1
-        });
-
-        vm.prank(token0TraderB);
-        swapRouter.swap{value: amountToken0B}({
-            amountSpecified: -int256(amountToken0B),
-            amountLimit: 0,
-            zeroForOne: true,
-            poolKey: key,
-            hookData: hook.getHookData(token0TraderB),
-            receiver: token0TraderB,
-            deadline: block.timestamp + 1
-        });
-
         vm.prank(token1TraderA);
-        token1.approve(address(swapRouter), type(uint256).max);
-        vm.prank(token1TraderB);
-        token1.approve(address(swapRouter), type(uint256).max);
-        uint256 token0BalanceToken1TraderABefore = token1TraderA.balance;
-        uint256 token0BalanceToken1TraderBBefore = token1TraderB.balance;
-
+        token1.approve(address(limitRouter), type(uint256).max);
         vm.prank(token1TraderA);
-        swapRouter.swap({
-            amountSpecified: -int256(amountToken1A),
-            amountLimit: 0,
-            zeroForOne: false,
-            poolKey: key,
-            hookData: hook.getHookData(token1TraderA),
-            receiver: token1TraderA,
-            deadline: block.timestamp + 1
-        });
+        token1.approve(address(limitRouter), type(uint256).max);
 
-        vm.prank(token1TraderB);
-        swapRouter.swap({
-            amountSpecified: -int256(amountToken1B),
-            amountLimit: 0,
-            zeroForOne: false,
-            poolKey: key,
-            hookData: hook.getHookData(token1TraderB),
-            receiver: token1TraderB,
-            deadline: block.timestamp + 1
-        });
+        _swapExactInput(token0TraderA, amountToken0A, true);
+        _swapExactInput(token0TraderB, amountToken0B, true);
+        _swapExactInput(token1TraderA, amountToken1A, false);
+        _swapExactInput(token1TraderB, amountToken1B, false);
 
         assertTrue(hook.clearBatch(key), "mixed-direction batch should clear");
 
+        uint256 token0OutA = currency0.balanceOf(token1TraderA);
+        uint256 token0OutB = currency0.balanceOf(token1TraderB);
         uint256 token1OutA = currency1.balanceOf(token0TraderA);
         uint256 token1OutB = currency1.balanceOf(token0TraderB);
-        uint256 token0OutA = token1TraderA.balance - token0BalanceToken1TraderABefore;
-        uint256 token0OutB = token1TraderB.balance - token0BalanceToken1TraderBBefore;
 
         assertGt(token1OutA, 0, "first token0 seller should receive token1");
         assertGt(token1OutB, 0, "second token0 seller should receive token1");
@@ -278,11 +236,52 @@ contract BatchingHookTest is BaseTest {
         _assertSameRate(token1OutA, amountToken0A, token1OutB, amountToken0B);
         _assertSameRate(token0OutA, amountToken1A, token0OutB, amountToken1B);
     }
+    
+    function _swapWithLimit(address trader, uint256 amountIn, bool zeroForOne, uint160 limit) internal {
+        bytes memory hookData = hook.getHookData(trader); // before the prank
+        MockERC20 token1 = MockERC20(Currency.unwrap(currency1));
 
-    function _assertSameRate(uint256 outputA, uint256 inputA, uint256 outputB, uint256 inputB) private pure {
-        uint256 productA = outputA * inputB;
-        uint256 productB = outputB * inputA;
-        uint256 difference = productA > productB ? productA - productB : productB - productA;
-        assertLe(difference, inputA + inputB, "same-direction orders should clear at the same price");
+        if (zeroForOne) {
+            vm.deal(trader, trader.balance + amountIn);
+        } else {
+            token1.mint(trader, amountIn);
+            vm.prank(trader);
+            token1.approve(address(limitRouter), type(uint256).max);
+        }
+
+        vm.prank(trader);
+        limitRouter.swap{value: zeroForOne ? amountIn : 0}(
+            key,
+            SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: -int256(amountIn),
+                sqrtPriceLimitX96: limit
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            hookData
+        );
+    }
+
+    function test_batchReverted() public {
+        address trader0 = address(0xA11CE);
+        address trader1 = address(0xB0B);
+        address trader2 = address(0xCAFE);
+        uint256 amount0 = 2e18;
+        uint256 amount1 = 1e18;
+        uint256 amount2 = 1e18;
+
+        _swapWithLimit(trader0, amount0, true, TickMath.MIN_SQRT_PRICE + 1);
+        _swapWithLimit(trader1, amount1, false, TickMath.MAX_SQRT_PRICE - 1);
+        _swapWithLimit(trader2, amount2, false, 69259048059136640427579878881);
+
+        assertFalse(hook.clearBatch(key), "mixed-direction batch should clear");
+
+        uint256 balTrader0 = currency0.balanceOf(trader0);
+        uint256 balTrader1 = currency1.balanceOf(trader1);
+        uint256 balTrader2 = currency1.balanceOf(trader2);
+
+        assertEq(amount0, balTrader0);
+        assertEq(amount1, balTrader1);
+        assertEq(amount2, balTrader2);
     }
 }

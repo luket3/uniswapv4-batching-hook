@@ -7,6 +7,7 @@ import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
+import {BalanceDelta, BalanceDeltaLibrary} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
@@ -17,6 +18,7 @@ import {console} from "forge-std/console.sol";
 import {EasyPosm} from "./utils/libraries/EasyPosm.sol";
 import {BaseTest} from "./utils/BaseTest.sol";
 import {BalanceCalc} from "../src/BalanceCalc.sol";
+import {SafeCast} from "v4-core/src/libraries/SafeCast.sol";
 
 contract BalanceCalcHarness {
     // Exposes the internal library function to tests through a deployed harness.
@@ -43,6 +45,9 @@ contract BalanceCalcTest is BaseTest {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
     using StateLibrary for IPoolManager;
+    using BalanceDeltaLibrary for BalanceDelta;
+    using SafeCast for uint256;
+	using SafeCast for int256;
 
     BalanceCalcHarness balanceCalc;
     PoolKey key;
@@ -62,31 +67,32 @@ contract BalanceCalcTest is BaseTest {
         _addLiquidity(-120, 120, 50e18);
     }
 
-    function test_balancingSwapMatchesSequentialExactInputSwaps() public {
+    function _swapExactInput(uint256 amountIn, bool zeroForOne) internal returns (uint256 amountOut) {
+        Currency outCurrency = zeroForOne ? currency1 : currency0;
+        uint256 balanceBefore = outCurrency.balanceOf(address(this));
+
+        swapRouter.swap({
+            amountSpecified: -int256(amountIn),
+            amountLimit: 0,
+            zeroForOne: zeroForOne,
+            poolKey: key,
+            hookData: "",
+            receiver: address(this),
+            deadline: block.timestamp + 1
+        });
+
+        amountOut = outCurrency.balanceOf(address(this)) - balanceBefore;
+    }
+
+    function test_testPriceMovement() public {
         uint256 amount0 = 200;
         uint256 amount1 = 100;
         uint160 lowerSqrtPriceX96 = TickMath.MIN_SQRT_PRICE;
         uint160 upperSqrtPriceX96 = TickMath.MAX_SQRT_PRICE;
         uint256 snapshotId = vm.snapshotState();
 
-        swapRouter.swap({
-            amountSpecified: -int256(amount0),
-            amountLimit: 0,
-            zeroForOne: true,
-            poolKey: key,
-            hookData: "",
-            receiver: address(this),
-            deadline: block.timestamp + 1
-        });
-        swapRouter.swap({
-            amountSpecified: -int256(amount1),
-            amountLimit: 0,
-            zeroForOne: false,
-            poolKey: key,
-            hookData: "",
-            receiver: address(this),
-            deadline: block.timestamp + 1
-        });
+        _swapExactInput(amount0, true);
+        _swapExactInput(amount1, false);
         (uint160 sequentialSqrtPriceX96,,,) = poolManager.getSlot0(key.toId());
 
         assertTrue(vm.revertToState(snapshotId), "pool state should restore before comparison");
@@ -99,22 +105,91 @@ contract BalanceCalcTest is BaseTest {
             lowerSqrtPriceX96
         );
         assertGt(balancingAmount, 0, "test inputs should produce a balancing swap");
-
-        swapRouter.swap({
-            amountSpecified: -int256(balancingAmount),
-            amountLimit: 0,
-            zeroForOne: zeroForOne,
-            poolKey: key,
-            hookData: "",
-            receiver: address(this),
-            deadline: block.timestamp + 1
-        });
+        _swapExactInput(balancingAmount, zeroForOne);
         (uint160 balancingSqrtPriceX96,,,) = poolManager.getSlot0(key.toId());
 
         assertEq(
             balancingSqrtPriceX96,
             sequentialSqrtPriceX96,
             "calculated balancing swap should match the sequential exact-input final price"
+        );
+    }
+
+    function test_balOutputAmount() public {
+        uint256 amount0 = 1e18;
+        uint256 amount1 = 5e17;
+        uint160 lowerSqrtPriceX96 = TickMath.MIN_SQRT_PRICE;
+        uint160 upperSqrtPriceX96 = TickMath.MAX_SQRT_PRICE;
+
+        (uint256 balancingAmount, bool zeroForOne) = balanceCalc.getAmountToBalance(
+            poolManager,
+            key,
+            amount0,
+            amount1,
+            upperSqrtPriceX96,
+            lowerSqrtPriceX96
+        );
+        assertGt(balancingAmount, 0, "balancing calculation should return a positive trade amount");
+
+        uint256 snapshotId = vm.snapshotState();
+
+        // Reference: plain exact-input swap with the same amount and direction
+        uint256 normalOutput1 = _swapExactInput(amount0, true);
+        uint256 normalOutput0 = _swapExactInput(amount1, false);
+
+        assertTrue(vm.revertToState(snapshotId), "pool state should restore before comparison");
+
+        // Balancing swap from the identical starting pool state
+        uint256 settledOutput = _swapExactInput(balancingAmount, zeroForOne);
+        uint256 amountOut0;
+        uint256 amountOut1;
+        if (zeroForOne) {
+            amountOut0 = amount0 - balancingAmount;
+            amountOut1 = amount1 + settledOutput;
+        } else {
+            amountOut1 = amount1 - balancingAmount;
+            amountOut0 = amount0 + settledOutput;
+        }
+
+        assertGe(
+            amountOut0,
+            normalOutput0,
+            "should produce more token0"
+        );
+        assertGe(
+            amountOut1,
+            normalOutput1,
+            "should produce more token1"
+        );
+    }
+
+    function test_Revert() public {
+        uint256 amount0 = 1e18;
+        uint256 amount1 = 5e17;
+        uint160 lowerSqrtPriceX96 = 78968337965930903587191341194;
+        uint160 upperSqrtPriceX96 = TickMath.MAX_SQRT_PRICE;
+
+        // should revert if lower bound is violated
+        vm.expectRevert(BalanceCalc.PriceLimitExceeded.selector);
+        balanceCalc.getAmountToBalance(
+            poolManager,
+            key,
+            amount0,
+            amount1,
+            upperSqrtPriceX96,
+            lowerSqrtPriceX96
+        );
+
+        // should revert if upper bound is violated
+        upperSqrtPriceX96 = 79492336248235127403565567700;
+        vm.expectRevert(BalanceCalc.PriceLimitExceeded.selector);
+        balanceCalc.getAmountToBalance(
+            poolManager,
+            key,
+            amount1,
+            amount0,
+            upperSqrtPriceX96,
+            lowerSqrtPriceX96
         );
     }
 

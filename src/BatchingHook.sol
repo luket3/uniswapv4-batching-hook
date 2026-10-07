@@ -19,6 +19,12 @@ import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockC
 import {SqrtPriceMath} from "v4-core/src/libraries/SqrtPriceMath.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 
+/**
+ * @title BatchingHook
+ * @author luket3
+ * @notice creates a beforeSwap hook that captures trades 
+ *         before swap and then executes then at a uniform clearing price
+ */
 contract BatchingHook is BaseHook, IUnlockCallback {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
@@ -99,17 +105,22 @@ contract BatchingHook is BaseHook, IUnlockCallback {
     ) internal returns (bool) {
         if (batchState.transactions.length == 0) {
             batchState.upperSqrtClearingPriceX96 = TickMath.MAX_SQRT_PRICE;
-            batchState.lowerSqrtClearingPriceX96 = TickMath.MIN_SQRT_PRICE;
-        } 
+            batchState.lowerSqrtClearingPriceX96 = 0;
+        }
+
+        // 0 means "no limit": nothing to tighten
+        if (sqrtPriceLimitX96 == 0) return true;
 
         if (zeroForOne) {
+            // limit is a price floor
             if (sqrtPriceLimitX96 > batchState.upperSqrtClearingPriceX96) return false;
             if (sqrtPriceLimitX96 > batchState.lowerSqrtClearingPriceX96) {
                 batchState.lowerSqrtClearingPriceX96 = sqrtPriceLimitX96;
             }
         } else {
+            // limit is a price ceiling
             if (sqrtPriceLimitX96 < batchState.lowerSqrtClearingPriceX96) return false;
-            if (sqrtPriceLimitX96 < batchState.upperSqrtClearingPriceX96 && sqrtPriceLimitX96 != 0) {
+            if (sqrtPriceLimitX96 < batchState.upperSqrtClearingPriceX96) {
                 batchState.upperSqrtClearingPriceX96 = sqrtPriceLimitX96;
             }
         }

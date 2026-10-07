@@ -289,10 +289,12 @@ library BalanceCalc {
 	 * @return protocolFee the protocol fee used to calculate swapfee
 	 * @return lpFee the lp fee used to calculate swapfee
 	 */
-	function _loadState(IPoolManager poolManager, PoolId poolId, uint256 amountIn0, uint256 amountIn1)
-		private
-		view
-		returns (SimulationState memory state, uint24 protocolFee, uint24 lpFee)
+	function _loadState(
+		IPoolManager poolManager,
+		PoolId poolId,
+		uint256 amountIn0,
+		uint256 amountIn1)
+	private view returns (SimulationState memory state, uint24 protocolFee, uint24 lpFee)
 	{
 		(state.sqrtPriceX96, state.tick, protocolFee, lpFee) = poolManager.getSlot0(poolId);
 		state.liquidity = poolManager.getLiquidity(poolId);
@@ -360,7 +362,7 @@ library BalanceCalc {
 		bool consumedAll = false;
 		while (!consumedAll) {
 			consumedAll = _stepAmountToBalanceMath(poolManager, config, state);
-			if ((state.sqrtPriceX96 <= sqrtPriceLowerX96 || state.sqrtPriceX96 >= sqrtPriceUpperX96) && !consumedAll) {
+			if ((state.sqrtPriceX96 < sqrtPriceLowerX96 || state.sqrtPriceX96 > sqrtPriceUpperX96)) {
 				revert PriceLimitExceeded();
 			}
 		}
