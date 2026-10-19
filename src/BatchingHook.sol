@@ -18,6 +18,7 @@ import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockC
 import {SqrtPriceMath} from "v4-core/src/libraries/SqrtPriceMath.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {FixedPoint96} from "v4-core/src/libraries/FixedPoint96.sol";
+import {IMsgSender} from "@uniswap/v4-periphery/src/interfaces/IMsgSender.sol";
 
 /**
  * @title BatchingHook
@@ -36,11 +37,11 @@ contract BatchingHook is BaseHook, IUnlockCallback {
     /// @notice thrown if the balancing swap exceeds the price limit
     error PriceLimitHit();
 
-    /// @notice thrown when hook calldata is malformed
-    error InvalidHookData();
-
     /// @notice thrown when clearBatch is called before MIN_BATCH_SIZE transactions have arrived
     error BatchTooSmall();
+
+    /// @notice thrown when a swap arrives from a router that has not been added to verifiedRouters
+    error RouterNotVerified();
 
     /// @notice minimum number of queued swaps required before clearBatch can settle
     uint256 constant MIN_BATCH_SIZE = 5;
@@ -65,12 +66,27 @@ contract BatchingHook is BaseHook, IUnlockCallback {
     /// @notice batch state keyed by pool id for queued swaps awaiting settlement
     mapping(PoolId => BatchState) public batchStates;
 
+    /// @notice routers trusted to report the original msg.sender via IMsgSender
+    mapping(address swapRouter => bool approved) public verifiedRouters;
+
     /// @dev guards the settlement swap from re-entering the batch logic during execution
     //      only used for testing will be removed in final product
     bool allowSwap;
 
     /// @dev the ID of the batch currently collecting, increases sequentially
     uint256 currBatchId;
+
+    /// @notice marks a router as trusted; it must implement IMsgSender
+    /// @param _router the router address to approve
+    function addRouter(address _router) external {
+        verifiedRouters[_router] = true;
+    }
+
+    /// @notice revokes trust from a previously approved router
+    /// @param _router the router address to remove
+    function removeRouter(address _router) external {
+        verifiedRouters[_router] = false;
+    }
 
     /// @notice creates the batching hook bound to a pool manager
     /// @param _poolManager the Uniswap v4 pool manager instance
@@ -98,13 +114,6 @@ contract BatchingHook is BaseHook, IUnlockCallback {
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
         });
-    }
-
-    /// @notice encodes the caller identity into a hook payload for batch processing
-    /// @param user the user whose address should be propagated with the swap
-    /// @return hookData the encoded user payload
-    function getHookData(address user) public pure returns (bytes memory) {
-        return abi.encode(user);
     }
 
     /// @notice validates that the next transaction fits within the current batch price bounds
@@ -173,15 +182,14 @@ contract BatchingHook is BaseHook, IUnlockCallback {
     /// @notice intercepts swap calls to queue exact-input trades into the batch until settlement
     /// @param key the pool key for the current swap
     /// @param params the parameters of the incoming swap
-    /// @param hookData caller metadata passed into the hook
     /// @return selector the hook callback selector
     /// @return delta the before-swap delta applied to the hook-managed balance
     /// @return fee the fee override for the swap, if any
     function _beforeSwap(
-        address, 
-        PoolKey calldata key, 
-        SwapParams calldata params, 
-        bytes calldata hookData
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        bytes calldata
     ) internal override returns (bytes4, BeforeSwapDelta, uint24)
     {
         PoolId poolId = key.toId();
@@ -206,9 +214,9 @@ contract BatchingHook is BaseHook, IUnlockCallback {
             poolManager.mint(address(this), input.toId(), amountTaken);
 
 
-            // update the batch state with the new transaction
-            if (hookData.length != 32) revert InvalidHookData();
-            address user = abi.decode(hookData, (address));
+            // recover the original caller from the router via IMsgSender
+            if (!verifiedRouters[sender]) revert RouterNotVerified();
+            address user = IMsgSender(sender).msgSender();
             _updateBatchState(
                 batchState,
                 params.zeroForOne,

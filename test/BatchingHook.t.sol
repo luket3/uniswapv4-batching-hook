@@ -20,8 +20,8 @@ import {BatchingHook} from "../src/BatchingHook.sol";
 import {BaseTest} from "./utils/BaseTest.sol";
 import {BalanceDelta, BalanceDeltaLibrary} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {console} from "forge-std/console.sol";
-import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
+import {MsgSenderPoolSwapTest} from "./utils/MsgSenderPoolSwapTest.sol";
 
 contract BatchingHookTest is BaseTest {
     using EasyPosm for IPositionManager;
@@ -37,7 +37,7 @@ contract BatchingHookTest is BaseTest {
     uint256 tokenId;
     int24 tickLower;
     int24 tickUpper;
-    PoolSwapTest limitRouter;
+    MsgSenderPoolSwapTest limitRouter;
 
     /// @notice swap specification used by permutation and batch-vs-sequential tests
     struct SwapSpec {
@@ -98,9 +98,12 @@ contract BatchingHookTest is BaseTest {
             amount1 + 1,
             address(this),
             block.timestamp + 1,
-            hook.getHookData(address(this))
+            ""
         );
-        limitRouter = new PoolSwapTest(poolManager);
+        limitRouter = new MsgSenderPoolSwapTest(poolManager);
+
+        hook.addRouter(address(swapRouter));
+        hook.addRouter(address(limitRouter));
     }
 
     /// @notice asserts that a single queued swap is asynchronous: input is consumed,
@@ -117,7 +120,7 @@ contract BatchingHookTest is BaseTest {
             amountLimit: 0,
             zeroForOne: zeroForOne,
             poolKey: key,
-            hookData: hook.getHookData(address(this)),
+            hookData: "",
             receiver: address(this),
             deadline: block.timestamp + 1
         });
@@ -154,7 +157,7 @@ contract BatchingHookTest is BaseTest {
             amountLimit: 0,
             zeroForOne: zeroForOne,
             poolKey: key,
-            hookData: hook.getHookData(address(this)),
+            hookData: "",
             receiver: address(this),
             deadline: block.timestamp + 1
         });
@@ -163,7 +166,7 @@ contract BatchingHookTest is BaseTest {
             amountLimit: 0,
             zeroForOne: zeroForOne,
             poolKey: key,
-            hookData: hook.getHookData(address(this)),
+            hookData: "",
             receiver: address(this),
             deadline: block.timestamp + 1
         });
@@ -186,7 +189,7 @@ contract BatchingHookTest is BaseTest {
             amountLimit: 0,
             zeroForOne: zeroForOne,
             poolKey: key,
-            hookData: hook.getHookData(trader),
+            hookData: "",
             receiver: address(this),
             deadline: block.timestamp + 1
         });
@@ -212,7 +215,7 @@ contract BatchingHookTest is BaseTest {
     /// @param zeroForOne true if swapping currency0 for currency1
     /// @param limit the sqrtPriceLimitX96 passed to the pool
     function _swapWithLimit(address trader, uint256 amountIn, bool zeroForOne, uint160 limit) internal {
-        bytes memory hookData = hook.getHookData(trader); // before the prank
+        bytes memory hookData = ""; // hookData unused; sender recovered via IMsgSender
         MockERC20 token1 = MockERC20(Currency.unwrap(currency1));
 
         if (zeroForOne) {
@@ -231,7 +234,7 @@ contract BatchingHookTest is BaseTest {
                 amountSpecified: -int256(amountIn),
                 sqrtPriceLimitX96: limit
             }),
-            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            MsgSenderPoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             hookData
         );
     }
@@ -407,7 +410,7 @@ contract BatchingHookTest is BaseTest {
     /// @param s the swap specification containing trader address, amount, and direction
     function _submitSwapViaLimitRouter(SwapSpec memory s) private {
         MockERC20 token1contract = MockERC20(Currency.unwrap(currency1));
-        bytes memory hookData = hook.getHookData(s.trader);
+        bytes memory hookData = ""; // hookData unused; sender recovered via IMsgSender
         if (s.zeroForOne) {
             vm.deal(s.trader, s.amountIn);
         } else {
@@ -423,7 +426,7 @@ contract BatchingHookTest is BaseTest {
                 amountSpecified:   -int256(s.amountIn),
                 sqrtPriceLimitX96: s.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
             }),
-            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            MsgSenderPoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             hookData
         );
     }
@@ -561,6 +564,10 @@ contract BatchingHookTest is BaseTest {
         token1.approve(address(limitRouter), type(uint256).max);
         vm.prank(token1TraderB);
         token1.approve(address(limitRouter), type(uint256).max);
+        vm.prank(token1TraderA);
+        token1.approve(address(swapRouter), type(uint256).max);
+        vm.prank(token1TraderB);
+        token1.approve(address(swapRouter), type(uint256).max);
 
         uint256 snap = vm.snapshotState();
         hook.allowRegularSwap();
@@ -621,7 +628,7 @@ contract BatchingHookTest is BaseTest {
             amountLimit: 0,
             zeroForOne: zeroForOne,
             poolKey: key,
-            hookData: hook.getHookData(address(this)),
+            hookData: "",
             receiver: address(this),
             deadline: block.timestamp + 1
         });
@@ -635,7 +642,7 @@ contract BatchingHookTest is BaseTest {
             amountLimit: 0,
             zeroForOne: zeroForOne,
             poolKey: key,
-            hookData: hook.getHookData(address(this)),
+            hookData: "",
             receiver: address(this),
             deadline: block.timestamp + 1
         });
