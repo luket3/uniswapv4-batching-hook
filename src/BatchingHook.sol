@@ -14,16 +14,16 @@ import {SafeCast} from "@uniswap/v4-core/src/libraries/SafeCast.sol";
 import {console} from "forge-std/console.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
-import {BalanceCalc} from "./BalanceCalc.sol";
 import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {SqrtPriceMath} from "v4-core/src/libraries/SqrtPriceMath.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {FixedPoint96} from "v4-core/src/libraries/FixedPoint96.sol";
 
 /**
  * @title BatchingHook
  * @author luket3
  * @notice creates a beforeSwap hook that captures trades 
- *         before swap and then executes then at a uniform clearing price
+ *         before swap and then executes as a batch
  */
 contract BatchingHook is BaseHook, IUnlockCallback {
     using PoolIdLibrary for PoolKey;
@@ -33,8 +33,17 @@ contract BatchingHook is BaseHook, IUnlockCallback {
     /// @notice thrown when a function is called from a non-hook context
     error OnlySelf();
 
+    /// @notice thrown if the balancing swap exceeds the price limit
+    error PriceLimitHit();
+
     /// @notice thrown when hook calldata is malformed
     error InvalidHookData();
+
+    /// @notice thrown when clearBatch is called before MIN_BATCH_SIZE transactions have arrived
+    error BatchTooSmall();
+
+    /// @notice minimum number of queued swaps required before clearBatch can settle
+    uint256 constant MIN_BATCH_SIZE = 5;
 
     /// @notice cached transaction data for one queued batch swap
     struct SwapTransaction {
@@ -47,6 +56,7 @@ contract BatchingHook is BaseHook, IUnlockCallback {
     struct BatchState {
         uint256 amountToken0;
         uint256 amountToken1;
+        uint160 sqrtStartPriceX96;
         uint160 upperSqrtClearingPriceX96;
         uint160 lowerSqrtClearingPriceX96;
         SwapTransaction[] transactions;
@@ -56,12 +66,17 @@ contract BatchingHook is BaseHook, IUnlockCallback {
     mapping(PoolId => BatchState) public batchStates;
 
     /// @dev guards the settlement swap from re-entering the batch logic during execution
+    //      only used for testing will be removed in final product
     bool allowSwap;
+
+    /// @dev the ID of the batch currently collecting, increases sequentially
+    uint256 currBatchId;
 
     /// @notice creates the batching hook bound to a pool manager
     /// @param _poolManager the Uniswap v4 pool manager instance
     constructor(IPoolManager _poolManager) BaseHook(_poolManager) {
         allowSwap = false;
+        currBatchId = 0;
     }
 
     /// @notice returns the hook permissions required by the batching logic
@@ -99,13 +114,15 @@ contract BatchingHook is BaseHook, IUnlockCallback {
     /// @param sqrtPriceLimitX96 the price limit being checked for the candidate swap
     /// @return valid true if the transaction can be added to the current batch
     function _checkValidTransaction(
+        PoolKey calldata pk,
         BatchState storage batchState, 
         bool zeroForOne,
         uint160 sqrtPriceLimitX96
     ) internal returns (bool) {
         if (batchState.transactions.length == 0) {
             batchState.upperSqrtClearingPriceX96 = TickMath.MAX_SQRT_PRICE;
-            batchState.lowerSqrtClearingPriceX96 = 0;
+            batchState.lowerSqrtClearingPriceX96 = TickMath.MIN_SQRT_PRICE;
+            (batchState.sqrtStartPriceX96,,,) = poolManager.getSlot0(pk.toId());
         }
 
         // 0 means "no limit": nothing to tighten
@@ -113,13 +130,13 @@ contract BatchingHook is BaseHook, IUnlockCallback {
 
         if (zeroForOne) {
             // limit is a price floor
-            if (sqrtPriceLimitX96 > batchState.upperSqrtClearingPriceX96) return false;
+            if (sqrtPriceLimitX96 > batchState.sqrtStartPriceX96) return false;
             if (sqrtPriceLimitX96 > batchState.lowerSqrtClearingPriceX96) {
                 batchState.lowerSqrtClearingPriceX96 = sqrtPriceLimitX96;
             }
         } else {
             // limit is a price ceiling
-            if (sqrtPriceLimitX96 < batchState.lowerSqrtClearingPriceX96) return false;
+            if (sqrtPriceLimitX96 < batchState.sqrtStartPriceX96) return false;
             if (sqrtPriceLimitX96 < batchState.upperSqrtClearingPriceX96) {
                 batchState.upperSqrtClearingPriceX96 = sqrtPriceLimitX96;
             }
@@ -176,6 +193,7 @@ contract BatchingHook is BaseHook, IUnlockCallback {
         } else if (params.amountSpecified < 0) {
         // AsyncSwap only works on exact-input swaps
             if (!_checkValidTransaction(
+                    key,
                     batchState, 
                     params.zeroForOne, 
                     params.sqrtPriceLimitX96)) {
@@ -205,79 +223,6 @@ contract BatchingHook is BaseHook, IUnlockCallback {
             revert("only exact-input swaps are supported by the batching hook");
         }
 
-    }
-
-    /// @notice calls the balance calculator from the hook context so it can validate settlement amounts
-    /// @param key the pool being balanced
-    /// @param amountIn0 the held token0 amount in the batch
-    /// @param amountIn1 the held token1 amount in the batch
-    /// @param sqrtPriceUpperX96 the upper clearing-price bound for the simulation
-    /// @param sqrtPriceLowerX96 the lower clearing-price bound for the simulation
-    /// @return amount the required settlement amount in the chosen direction
-    /// @return zeroForOne whether the trade should execute zero-for-one
-    function _callBalanceCalc(
-        PoolKey memory key,
-		uint256 amountIn0,
-		uint256 amountIn1,
-		uint160 sqrtPriceUpperX96,
-		uint160 sqrtPriceLowerX96
-    ) external view returns (uint256 amount, bool zeroForOne) {
-        if (msg.sender != address(this)) revert OnlySelf();
-        return BalanceCalc.getAmountToBalance(poolManager, key, amountIn0, amountIn1, sqrtPriceUpperX96, sqrtPriceLowerX96);
-    }
-
-    /// @notice attempts to compute the settlement trade for the current batch state
-    /// @param key the pool being settled
-    /// @param amountIn0 the queued token0 balance for the batch
-    /// @param amountIn1 the queued token1 balance for the batch
-    /// @param sqrtPriceUpperX96 the upper settlement bound
-    /// @param sqrtPriceLowerX96 the lower settlement bound
-    /// @return amount the settlement amount to swap
-    /// @return zeroForOne the direction of the settlement swap
-    /// @return valid true if a valid balancing trade exists
-    function _getAmountToBalance(
-        PoolKey memory key,
-		uint256 amountIn0,
-		uint256 amountIn1,
-		uint160 sqrtPriceUpperX96,
-		uint160 sqrtPriceLowerX96
-    ) internal view returns(uint256 amount, bool zeroForOne, bool valid) { 
-        try this._callBalanceCalc(key, amountIn0, amountIn1, sqrtPriceUpperX96, sqrtPriceLowerX96)
-            returns (uint256 _amount, bool _zeroForOne)
-        {
-            return (_amount, _zeroForOne, true);
-        } catch {
-            return (0, false, false);
-        }
-    }
-
-    /// @notice computes the settlement trade and price limit for the current batch
-    /// @param sqrtPriceUpperX96 the upper limit for the settlement trade
-    /// @param sqrtPriceLowerX96 the lower limit for the settlement trade
-    /// @param amount0 the token0 amount queued in the batch
-    /// @param amount1 the token1 amount queued in the batch
-    /// @param key the pool undergoing settlement
-    /// @return amount the swap amount to execute
-    /// @return sqrtPriceLimitX96 the price cap or floor for the settlement swap
-    /// @return zeroForOne the direction of the settlement swap
-    /// @return valid true if the batch can be settled with a valid balancing trade
-    function _calculateSwap(
-        uint160 sqrtPriceUpperX96, 
-        uint160 sqrtPriceLowerX96,
-        uint256 amount0,
-        uint256 amount1,
-        PoolKey memory key
-    ) internal view returns (uint256 amount, uint160 sqrtPriceLimitX96, bool zeroForOne, bool valid) {
-        (amount, zeroForOne, valid) = _getAmountToBalance(
-            key, amount0, amount1, sqrtPriceUpperX96, sqrtPriceLowerX96
-        );
-
-        if (!valid) {
-            return (0, 0, false, false);
-        }
-        sqrtPriceLimitX96 = zeroForOne 
-            ? sqrtPriceLowerX96 
-            : sqrtPriceUpperX96;
     }
 
     /// @notice resolves the pool delta back into mint and burn operations for the hook account
@@ -313,7 +258,7 @@ contract BatchingHook is BaseHook, IUnlockCallback {
         uint256 totalOutput1 = poolManager.balanceOf(address(this), key.currency1.toId());
 
         for (uint256 i = 0; i < transactions.length; i++) {
-            SwapTransaction memory swapTransaction = transactions[i];
+            SwapTransaction storage swapTransaction = transactions[i];
             uint256 amountIn = uint256(-swapTransaction.amountSpecified);
             uint256 outputAmount;
             if (swapTransaction.zeroForOne) {
@@ -330,11 +275,11 @@ contract BatchingHook is BaseHook, IUnlockCallback {
     /// @param transactions the queued swaps that need to be unwound
     /// @param key the pool associated with the pending batch
     function _revertBatch(
-        SwapTransaction[] memory transactions,
+        SwapTransaction[] storage transactions,
         PoolKey memory key
     ) internal {
         for (uint256 i = 0; i < transactions.length; i++) {
-            SwapTransaction memory swapTransaction = transactions[i];
+            SwapTransaction storage swapTransaction = transactions[i];
             uint256 amountIn = uint256(-swapTransaction.amountSpecified);
             Currency input = swapTransaction.zeroForOne ? key.currency0 : key.currency1;
             _burnClaimAndTake(input, swapTransaction.receiver, amountIn);
@@ -348,11 +293,115 @@ contract BatchingHook is BaseHook, IUnlockCallback {
     function _burnClaimAndTake(Currency currency, address recipient, uint256 amount) private {
         if (amount == 0) return;
         poolManager.burn(address(this), currency.toId(), amount);
-        poolManager.take(currency, recipient, amount);
+        try poolManager.take(currency, recipient, amount) {}
+        catch {}
+    }
+
+    /// @notice tries to swap some amount, if the swap trades past the provided
+    ///         price limit reverts the swap
+    /// @param key the pool key of the pool to swap too
+    /// @param zeroForOne if the trade is swapping token0 for token1
+    /// @param amountIn the amount to swap
+    /// @param sqrtPriceLimitX96 the price limit of the swap
+    /// @return delta the BalanceDelta returned by the swap
+    function swapOrRevert(
+        PoolKey memory key,
+        bool zeroForOne,
+        uint256 amountIn,
+        uint160 sqrtPriceLimitX96
+    ) external returns (BalanceDelta delta) {
+        if (msg.sender != address(this)) revert OnlySelf();
+
+        int256 amountSpecified = -int256(amountIn);
+        allowSwap = true;
+        delta = poolManager.swap(
+            key,
+            SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: amountSpecified,
+                sqrtPriceLimitX96: sqrtPriceLimitX96
+            }),
+            ""
+        );
+        allowSwap = false;
+
+        int128 inputSide = zeroForOne ? delta.amount0() : delta.amount1();
+        if (inputSide != amountSpecified) revert PriceLimitHit(); // undoes the swap
+    }
+
+    /// @notice Given amounts of token0 and token1, find how much of the
+	///         "excess" token to remove so the remainders are worth exactly
+	///         the same at `sqrtPriceX96` (value1 = value0 * price).
+	/// @param amount0 amount of token0
+	/// @param amount1 amount of token1
+	/// @param sqrtPriceX96 the price to trade tokens at
+	/// @return excessIsToken0 true if token0 is the excess side
+	/// @return excessAmount   amount of the excess token to remove (the residual)
+	function netAtPrice(uint256 amount0, uint256 amount1, uint160 sqrtPriceX96)
+		internal
+		pure
+		returns (bool excessIsToken0, uint256 excessAmount)
+	{
+		// value of all token0 expressed in token1: amount0 * (sqrtP / 2^96)^2
+		// (two mulDivs because sqrtP^2 can exceed 256 bits)
+		uint256 value0In1 = FullMath.mulDiv(
+			FullMath.mulDiv(amount0, sqrtPriceX96, FixedPoint96.Q96), sqrtPriceX96, FixedPoint96.Q96
+		);
+
+		if (value0In1 > amount1) {
+			// token0 is in excess: keep only as much token0 as amount1 can match
+			// keep0 = amount1 / price = amount1 * 2^192 / sqrtP^2 (rounded down)
+			uint256 keep0 = FullMath.mulDiv(
+				FullMath.mulDiv(amount1, FixedPoint96.Q96, sqrtPriceX96), FixedPoint96.Q96, sqrtPriceX96
+			);
+			if (keep0 > amount0) keep0 = amount0; // guard against rounding
+			excessIsToken0 = true;
+			excessAmount = amount0 - keep0;
+		} else {
+			// token1 is in excess: keep only as much token1 as amount0 is worth
+			uint256 keep1 = value0In1; // already rounded down
+			excessIsToken0 = false;
+			excessAmount = amount1 - keep1;
+		}
+	}
+
+    /// @notice pays the batch-clearing caller a gas rebate split equally in value
+    ///         across both token reserves held by the hook.
+    /// @dev    called after any residual pool swap so the full reserve is available;
+    ///         each side is capped at the hook's current claim balance to prevent underflow.
+    /// @param pk the pool key whose reserves fund the rebate
+    /// @param caller the address that called clearBatch and will receive the rebate
+    /// @param batchState the batch being settled, used for n and the entry sqrtPrice
+    function _payCompensation(
+        PoolKey memory pk,
+        address caller,
+        BatchState storage batchState
+    ) internal {
+        uint256 n = batchState.transactions.length;
+        // gas price is capped at 2× basefee to prevent fee-spike manipulation
+        uint256 effectiveGasPrice = tx.gasprice < 2 * block.basefee ? tx.gasprice : 2 * block.basefee;
+        // half of (221700 + 40600n) * effectiveGasPrice * 1.1, one half per token side
+        uint256 halfEth = (221700 + 40600 * n) * effectiveGasPrice * 11 / 20;
+
+        // convert the ETH-denominated half to an equivalent token1 amount at the
+        // batch entry price:  c1 = halfEth * (sqrtP / 2^96)^2
+        uint256 c1 = FullMath.mulDiv(
+            FullMath.mulDiv(halfEth, batchState.sqrtStartPriceX96, FixedPoint96.Q96),
+            batchState.sqrtStartPriceX96,
+            FixedPoint96.Q96
+        );
+
+        uint256 bal0 = poolManager.balanceOf(address(this), pk.currency0.toId());
+        uint256 bal1 = poolManager.balanceOf(address(this), pk.currency1.toId());
+        uint256 comp0 = halfEth < bal0 ? halfEth : bal0;
+        uint256 comp1 = c1     < bal1 ? c1      : bal1;
+
+        _burnClaimAndTake(pk.currency0, caller, comp0);
+        _burnClaimAndTake(pk.currency1, caller, comp1);
     }
 
     /// @notice executes the queued batch settlement inside the pool manager unlock callback
-    /// @param data encoded pool data needed to settle the batch
+    /// @param data encoded pool data and the clearBatch caller needed to settle the batch
     /// @return rtnData a boolean outcome encoded for the caller
     function unlockCallback(
         bytes calldata data
@@ -360,61 +409,89 @@ contract BatchingHook is BaseHook, IUnlockCallback {
         require(msg.sender == address(poolManager));
 
         // try to calculate balancing trade
-        (PoolKey memory pk) = abi.decode(data, (PoolKey));
+        (PoolKey memory pk, address caller) = abi.decode(data, (PoolKey, address));
         PoolId poolId = pk.toId();
         BatchState storage batchState = batchStates[poolId];
-        (uint256 _amount, uint160 _sqrtPriceLimitX96, bool _zeroForOne, bool _valid) = _calculateSwap(
-            batchState.upperSqrtClearingPriceX96,
-            batchState.lowerSqrtClearingPriceX96,
+        (bool excessIsToken0, uint256 excessAmount) = netAtPrice(
             batchState.amountToken0,
             batchState.amountToken1,
-            pk
-        );
+            batchState.sqrtStartPriceX96);
 
-        if (_valid) {
-        // if a valid settlement swap is found settle batch
-            allowSwap = true;
-            BalanceDelta delta = poolManager.swap(
-            pk,
-            SwapParams({
-                zeroForOne: _zeroForOne,
-                amountSpecified: -int256(_amount),
-                sqrtPriceLimitX96: _sqrtPriceLimitX96
-            }),
-            "");
-            allowSwap = false;
-            _resolveSwapDelta(delta, pk);
-            _clearTransactions(
-                batchState.transactions,
-                batchState.amountToken0,
-                batchState.amountToken1,
-                pk);
-            
-            delete batchStates[poolId];
-            bytes memory rtnData = abi.encode(true);
-            return rtnData;
+        bool okay;
+        if (excessAmount > 0) {
+            uint160 sqrtPriceLimitX96 = excessIsToken0
+                ? batchState.lowerSqrtClearingPriceX96
+                : batchState.upperSqrtClearingPriceX96;
+            try this.swapOrRevert(pk, excessIsToken0, excessAmount, sqrtPriceLimitX96) returns (BalanceDelta delta) {
+                // if the settlement swap is valid
+                _resolveSwapDelta(delta, pk);
+                _payCompensation(pk, caller, batchState);
+                _clearTransactions(
+                    batchState.transactions,
+                    batchState.amountToken0,
+                    batchState.amountToken1,
+                    pk);
+                okay = true;
+            } catch {
+                // if the settlement swap violates sqrtPriceLimit
+                _revertBatch(batchState.transactions, pk);
+                okay = false;
+            }
         } else {
-        // if a valid settlement swap was not found revert batch and return input tokens to users
-            _revertBatch(batchState.transactions, pk);
-            delete batchStates[poolId];
-            bytes memory rtnData = abi.encode(false);
-            return rtnData;
+            // if branch is perfectly balanced
+            _payCompensation(pk, caller, batchState);
+            _clearTransactions(
+                    batchState.transactions,
+                    batchState.amountToken0,
+                    batchState.amountToken1,
+                    pk);
+            okay = true;
         }
+        delete batchStates[poolId];
+        bytes memory rtnData = abi.encode(okay);
+        return rtnData;
     }
 
-    /// @notice settles a queued batch for the provided pool if one exists
-    /// @dev this should be called by an outside party to clear the batch
-    /// @param key the pool whose pending batch should be processed
-    /// @return settled true if the batch executed successfully, false if there was no queued batch
-    function clearBatch(
-        PoolKey calldata key
-    ) external returns (bool) {
-        BatchState memory batchState = batchStates[key.toId()];
-        if (batchState.transactions.length <= 0) {
-            return false;
-        }
-
-        bytes memory output = poolManager.unlock(abi.encode(key));
+    /// @notice shared settlement path for both clearBatch variants
+    function _executeClear(PoolKey calldata key) internal returns (bool) {
+        BatchState storage batchState = batchStates[key.toId()];
+        if (batchState.transactions.length == 0) return false;
+        currBatchId++;
+        bytes memory output = poolManager.unlock(abi.encode(key, msg.sender));
         return abi.decode(output, (bool));
+    }
+
+    /// @notice settles a queued batch; reverts if fewer than MIN_BATCH_SIZE swaps have arrived
+    /// @param key the pool whose pending batch should be processed
+    /// @return settled true if the batch executed successfully
+    function clearBatch(PoolKey calldata key) external returns (bool) {
+        BatchState storage batchState = batchStates[key.toId()];
+        if (batchState.transactions.length < MIN_BATCH_SIZE) revert BatchTooSmall();
+        return _executeClear(key);
+    }
+
+    /// @notice allows the caller to check if batchId is cleared
+    /// @param batchId the id of batch to check if cleared
+    function cleared(uint batchId) external view returns (bool) {
+        return batchId == currBatchId;
+    }
+
+
+    // all functions below are for testing purposes only, will be removed for
+    // final product
+
+    /// @notice settles a queued batch immediately, ignoring BATCH_INTERVAL
+    /// @param key the pool whose pending batch should be processed
+    /// @return settled true if the batch executed successfully
+    function clearBatchNoInterval(PoolKey calldata key) external returns (bool) {
+        return _executeClear(key);
+    }
+
+    function allowRegularSwap() external {
+        allowSwap = true;
+    }
+
+    function disallowRegularSwap() external {
+        allowSwap = false;
     }
 }
