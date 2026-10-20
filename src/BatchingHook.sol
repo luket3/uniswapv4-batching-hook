@@ -49,7 +49,6 @@ contract BatchingHook is BaseHook, IUnlockCallback {
     /// @notice cached transaction data for one queued batch swap
     struct SwapTransaction {
         int256 amountSpecified;
-        bool zeroForOne;
         address receiver;
     }
 
@@ -60,7 +59,8 @@ contract BatchingHook is BaseHook, IUnlockCallback {
         uint160 sqrtStartPriceX96;
         uint160 upperSqrtClearingPriceX96;
         uint160 lowerSqrtClearingPriceX96;
-        SwapTransaction[] transactions;
+        SwapTransaction[] zfoTransactions;
+        SwapTransaction[] ofzTransactions;
     }
 
     /// @notice batch state keyed by pool id for queued swaps awaiting settlement
@@ -116,6 +116,13 @@ contract BatchingHook is BaseHook, IUnlockCallback {
         });
     }
 
+    /// @notice returns the total number of queued swaps across both directions
+    /// @param batchState the batch state to count
+    /// @return count the combined length of the zeroForOne and oneForZero queues
+    function _numTransactions(BatchState storage batchState) internal view returns (uint256) {
+        return batchState.zfoTransactions.length + batchState.ofzTransactions.length;
+    }
+
     /// @notice validates that the next transaction fits within the current batch price bounds
     /// @dev updates the batches upper and lower price limit if a tighter bound is found
     /// @param batchState the in-flight batch state for the pool
@@ -128,7 +135,7 @@ contract BatchingHook is BaseHook, IUnlockCallback {
         bool zeroForOne,
         uint160 sqrtPriceLimitX96
     ) internal returns (bool) {
-        if (batchState.transactions.length == 0) {
+        if (_numTransactions(batchState) == 0) {
             batchState.upperSqrtClearingPriceX96 = TickMath.MAX_SQRT_PRICE;
             batchState.lowerSqrtClearingPriceX96 = TickMath.MIN_SQRT_PRICE;
             (batchState.sqrtStartPriceX96,,,) = poolManager.getSlot0(pk.toId());
@@ -166,17 +173,18 @@ contract BatchingHook is BaseHook, IUnlockCallback {
         int256 amountSpecified,
         address user
     ) internal {
+        SwapTransaction memory swapTransaction = SwapTransaction({
+            amountSpecified: amountSpecified,
+            receiver: user
+        });
+
         if (zeroForOne) {
             batchState.amountToken0 += amountTaken;
+            batchState.zfoTransactions.push(swapTransaction);
         } else {
             batchState.amountToken1 += amountTaken;
+            batchState.ofzTransactions.push(swapTransaction);
         }
-
-        batchState.transactions.push(SwapTransaction({
-            amountSpecified: amountSpecified,
-            zeroForOne: zeroForOne,
-            receiver: user
-        }));
     }
 
     /// @notice intercepts swap calls to queue exact-input trades into the batch until settlement
@@ -253,44 +261,50 @@ contract BatchingHook is BaseHook, IUnlockCallback {
     }
 
     /// @notice settles each queued swap by distributing the correct share of the batch output
-    /// @param transactions the queued swap list to process
-    /// @param amountToken0 the total amount of token0 held in the batch
-    /// @param amountToken1 the total amount of token1 held in the batch
+    /// @param batchState the batch whose zeroForOne and oneForZero queues are processed
     /// @param key the pool whose settlement outputs should be distributed
     function _clearTransactions(
-        SwapTransaction[] storage transactions, 
-        uint256 amountToken0,
-        uint256 amountToken1,
+        BatchState storage batchState,
         PoolKey memory key) internal {
         uint256 totalOutput0 = poolManager.balanceOf(address(this), key.currency0.toId());
         uint256 totalOutput1 = poolManager.balanceOf(address(this), key.currency1.toId());
 
-        for (uint256 i = 0; i < transactions.length; i++) {
-            SwapTransaction storage swapTransaction = transactions[i];
+        // zeroForOne swaps receive a pro-rata share of the token1 output
+        SwapTransaction[] storage zfoTransactions = batchState.zfoTransactions;
+        for (uint256 i = 0; i < zfoTransactions.length; i++) {
+            SwapTransaction storage swapTransaction = zfoTransactions[i];
             uint256 amountIn = uint256(-swapTransaction.amountSpecified);
-            uint256 outputAmount;
-            if (swapTransaction.zeroForOne) {
-                outputAmount = FullMath.mulDiv(amountIn, totalOutput1, amountToken0);
-                _burnClaimAndTake(key.currency1, swapTransaction.receiver, outputAmount);
-            } else {
-                outputAmount = FullMath.mulDiv(amountIn, totalOutput0, amountToken1);
-                _burnClaimAndTake(key.currency0, swapTransaction.receiver, outputAmount);
-            }
+            uint256 outputAmount = FullMath.mulDiv(amountIn, totalOutput1, batchState.amountToken0);
+            _burnClaimAndTake(key.currency1, swapTransaction.receiver, outputAmount);
+        }
+
+        // oneForZero swaps receive a pro-rata share of the token0 output
+        SwapTransaction[] storage ofzTransactions = batchState.ofzTransactions;
+        for (uint256 i = 0; i < ofzTransactions.length; i++) {
+            SwapTransaction storage swapTransaction = ofzTransactions[i];
+            uint256 amountIn = uint256(-swapTransaction.amountSpecified);
+            uint256 outputAmount = FullMath.mulDiv(amountIn, totalOutput0, batchState.amountToken1);
+            _burnClaimAndTake(key.currency0, swapTransaction.receiver, outputAmount);
         }
     }
 
     /// @notice reverts a queued batch by returning each user’s input token to the original receiver
-    /// @param transactions the queued swaps that need to be unwound
+    /// @param batchState the batch whose queued swaps need to be unwound
     /// @param key the pool associated with the pending batch
     function _revertBatch(
-        SwapTransaction[] storage transactions,
+        BatchState storage batchState,
         PoolKey memory key
     ) internal {
-        for (uint256 i = 0; i < transactions.length; i++) {
-            SwapTransaction storage swapTransaction = transactions[i];
-            uint256 amountIn = uint256(-swapTransaction.amountSpecified);
-            Currency input = swapTransaction.zeroForOne ? key.currency0 : key.currency1;
-            _burnClaimAndTake(input, swapTransaction.receiver, amountIn);
+        SwapTransaction[] storage zfoTransactions = batchState.zfoTransactions;
+        for (uint256 i = 0; i < zfoTransactions.length; i++) {
+            SwapTransaction storage swapTransaction = zfoTransactions[i];
+            _burnClaimAndTake(key.currency0, swapTransaction.receiver, uint256(-swapTransaction.amountSpecified));
+        }
+
+        SwapTransaction[] storage ofzTransactions = batchState.ofzTransactions;
+        for (uint256 i = 0; i < ofzTransactions.length; i++) {
+            SwapTransaction storage swapTransaction = ofzTransactions[i];
+            _burnClaimAndTake(key.currency1, swapTransaction.receiver, uint256(-swapTransaction.amountSpecified));
         }
     }
 
@@ -373,37 +387,49 @@ contract BatchingHook is BaseHook, IUnlockCallback {
 		}
 	}
 
-    /// @notice pays the batch-clearing caller a gas rebate split equally in value
-    ///         across both token reserves held by the hook.
-    /// @dev    called after any residual pool swap so the full reserve is available;
-    ///         each side is capped at the hook's current claim balance to prevent underflow.
-    /// @param pk the pool key whose reserves fund the rebate
-    /// @param caller the address that called clearBatch and will receive the rebate
-    /// @param batchState the batch being settled, used for n and the entry sqrtPrice
-    function _payCompensation(
-        PoolKey memory pk,
-        address caller,
+    /// @notice computes the batch-clearing caller's gas rebate, taking value from
+    ///         each token side in proportion to the number of swaps trading in that direction.
+    /// @dev    called before balancing so the rebate is removed from the amounts being netted;
+    ///         each side is capped at the batch's input amount for that token.
+    /// @param batchState the batch being settled, used for the direction counts and entry sqrtPrice
+    /// @return comp0 the token0 amount owed to the caller (funded by zeroForOne swaps)
+    /// @return comp1 the token1 amount owed to the caller (funded by oneForZero swaps)
+    function _computeCompensation(
         BatchState storage batchState
-    ) internal {
-        uint256 n = batchState.transactions.length;
+    ) internal view returns (uint256 comp0, uint256 comp1) {
+        uint256 nZfo = batchState.zfoTransactions.length;
+        uint256 nOfz = batchState.ofzTransactions.length;
+        uint256 n = nZfo + nOfz;
         // gas price is capped at 2× basefee to prevent fee-spike manipulation
         uint256 effectiveGasPrice = tx.gasprice < 2 * block.basefee ? tx.gasprice : 2 * block.basefee;
-        // half of (221700 + 40600n) * effectiveGasPrice * 1.1, one half per token side
-        uint256 halfEth = (221700 + 40600 * n) * effectiveGasPrice * 11 / 20;
+        // (286049 + 42135n) * effectiveGasPrice * 1.1, split by the share of swaps in each direction
+        uint256 gasCost = (286049 + 42135 * n) * effectiveGasPrice * 11;
+        uint256 eth0 = gasCost * nZfo / (10 * n);
+        uint256 eth1 = gasCost * nOfz / (10 * n);
 
-        // convert the ETH-denominated half to an equivalent token1 amount at the
-        // batch entry price:  c1 = halfEth * (sqrtP / 2^96)^2
+        // convert the ETH-denominated token1 share to an equivalent token1 amount at the
+        // batch entry price:  c1 = eth1 * (sqrtP / 2^96)^2
         uint256 c1 = FullMath.mulDiv(
-            FullMath.mulDiv(halfEth, batchState.sqrtStartPriceX96, FixedPoint96.Q96),
+            FullMath.mulDiv(eth1, batchState.sqrtStartPriceX96, FixedPoint96.Q96),
             batchState.sqrtStartPriceX96,
             FixedPoint96.Q96
         );
 
-        uint256 bal0 = poolManager.balanceOf(address(this), pk.currency0.toId());
-        uint256 bal1 = poolManager.balanceOf(address(this), pk.currency1.toId());
-        uint256 comp0 = halfEth < bal0 ? halfEth : bal0;
-        uint256 comp1 = c1     < bal1 ? c1      : bal1;
+        comp0 = eth0 < batchState.amountToken0 ? eth0 : batchState.amountToken0;
+        comp1 = c1   < batchState.amountToken1 ? c1   : batchState.amountToken1;
+    }
 
+    /// @notice pays the batch-clearing caller the rebate computed by _computeCompensation
+    /// @param pk the pool key whose reserves fund the rebate
+    /// @param caller the address that called clearBatch and will receive the rebate
+    /// @param comp0 the token0 amount to pay
+    /// @param comp1 the token1 amount to pay
+    function _payCompensation(
+        PoolKey memory pk,
+        address caller,
+        uint256 comp0,
+        uint256 comp1
+    ) internal {
         _burnClaimAndTake(pk.currency0, caller, comp0);
         _burnClaimAndTake(pk.currency1, caller, comp1);
     }
@@ -420,9 +446,12 @@ contract BatchingHook is BaseHook, IUnlockCallback {
         (PoolKey memory pk, address caller) = abi.decode(data, (PoolKey, address));
         PoolId poolId = pk.toId();
         BatchState storage batchState = batchStates[poolId];
+
+        // set aside the caller's compensation from each side before balancing
+        (uint256 comp0, uint256 comp1) = _computeCompensation(batchState);
         (bool excessIsToken0, uint256 excessAmount) = netAtPrice(
-            batchState.amountToken0,
-            batchState.amountToken1,
+            batchState.amountToken0 - comp0,
+            batchState.amountToken1 - comp1,
             batchState.sqrtStartPriceX96);
 
         bool okay;
@@ -433,26 +462,18 @@ contract BatchingHook is BaseHook, IUnlockCallback {
             try this.swapOrRevert(pk, excessIsToken0, excessAmount, sqrtPriceLimitX96) returns (BalanceDelta delta) {
                 // if the settlement swap is valid
                 _resolveSwapDelta(delta, pk);
-                _payCompensation(pk, caller, batchState);
-                _clearTransactions(
-                    batchState.transactions,
-                    batchState.amountToken0,
-                    batchState.amountToken1,
-                    pk);
+                _payCompensation(pk, caller, comp0, comp1);
+                _clearTransactions(batchState, pk);
                 okay = true;
             } catch {
                 // if the settlement swap violates sqrtPriceLimit
-                _revertBatch(batchState.transactions, pk);
+                _revertBatch(batchState, pk);
                 okay = false;
             }
         } else {
             // if branch is perfectly balanced
-            _payCompensation(pk, caller, batchState);
-            _clearTransactions(
-                    batchState.transactions,
-                    batchState.amountToken0,
-                    batchState.amountToken1,
-                    pk);
+            _payCompensation(pk, caller, comp0, comp1);
+            _clearTransactions(batchState, pk);
             okay = true;
         }
         delete batchStates[poolId];
@@ -463,7 +484,7 @@ contract BatchingHook is BaseHook, IUnlockCallback {
     /// @notice shared settlement path for both clearBatch variants
     function _executeClear(PoolKey calldata key) internal returns (bool) {
         BatchState storage batchState = batchStates[key.toId()];
-        if (batchState.transactions.length == 0) return false;
+        if (_numTransactions(batchState) == 0) return false;
         currBatchId++;
         bytes memory output = poolManager.unlock(abi.encode(key, msg.sender));
         return abi.decode(output, (bool));
@@ -474,7 +495,7 @@ contract BatchingHook is BaseHook, IUnlockCallback {
     /// @return settled true if the batch executed successfully
     function clearBatch(PoolKey calldata key) external returns (bool) {
         BatchState storage batchState = batchStates[key.toId()];
-        if (batchState.transactions.length < MIN_BATCH_SIZE) revert BatchTooSmall();
+        if (_numTransactions(batchState) < MIN_BATCH_SIZE) revert BatchTooSmall();
         return _executeClear(key);
     }
 

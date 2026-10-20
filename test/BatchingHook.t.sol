@@ -267,8 +267,9 @@ contract BatchingHookTest is BaseTest {
         vm.revertToState(snapBefore);
     }
 
-    /// @notice verifies that the caller of clearBatch receives a gas rebate split equally
-    ///         from both token reserves, computed as (221700 + 40600*n) * gasPrice * 1.1 / 2
+    /// @notice verifies that the caller of clearBatch receives a gas rebate of
+    ///         (286049 + 42135*n) * gasPrice * 1.1, taken from each token side in proportion
+    ///         to the number of swaps in that direction, so every trader funds an equal share
     function test_clearBatchCallerCompensation() public {
         uint256 snapBefore = vm.snapshotState();
         address caller = address(0xC1EA);
@@ -278,18 +279,29 @@ contract BatchingHookTest is BaseTest {
         vm.fee(10 gwei);
         vm.txGasPrice(15 gwei);
 
-        // Balanced two-sided batch: equal amounts of token0 and token1 at the
-        // 1:1 initialisation price.  No residual pool swap is needed, so the
-        // hook holds exactly 1e18 of each token when _payCompensation runs.
-        _swapWithLimit(address(0xAAAA), 1e18, true,  TickMath.MIN_SQRT_PRICE + 1);
-        _swapWithLimit(address(0xBBBB), 1e18, false, TickMath.MAX_SQRT_PRICE - 1);
+        // Uneven direction counts (3 zeroForOne, 2 oneForZero) with equal total value
+        // on each side at the 1:1 initialisation price.
+        address[3] memory zfoTraders = [address(0xA1), address(0xA2), address(0xA3)];
+        address[2] memory ofzTraders = [address(0xB1), address(0xB2)];
+        uint256 zfoAmountIn = 1e18;
+        uint256 ofzAmountIn = 1.5e18;
+        for (uint256 i = 0; i < zfoTraders.length; i++) {
+            _swapWithLimit(zfoTraders[i], zfoAmountIn, true, TickMath.MIN_SQRT_PRICE + 1);
+        }
+        for (uint256 i = 0; i < ofzTraders.length; i++) {
+            _swapWithLimit(ofzTraders[i], ofzAmountIn, false, TickMath.MAX_SQRT_PRICE - 1);
+        }
+
+        // Pre-compute expected compensation.
+        // n=5, effectiveGasPrice=15 gwei; at SQRT_PRICE_1_1 price=1 so token1 needs no conversion.
+        uint256 n = 5;
+        uint256 gasCost = (286049 + 42135 * n) * 15 gwei * 11;
+        uint256 expectedComp0 = gasCost * zfoTraders.length / (10 * n);
+        uint256 expectedComp1 = gasCost * ofzTraders.length / (10 * n);
+        uint256 expectedPerTrader = gasCost / (10 * n);
 
         uint256 callerEthBefore  = currency0.balanceOf(caller);
         uint256 callerTok1Before = currency1.balanceOf(caller);
-
-        // Pre-compute expected per-side compensation.
-        // n=2, effectiveGasPrice=15 gwei; at SQRT_PRICE_1_1 price=1 so c0==c1.
-        uint256 halfEth = (221700 + 40600 * 2) * 15 gwei * 11 / 20;
 
         vm.prank(caller);
         assertTrue(hook.clearBatchNoInterval(key), "clearBatch should succeed");
@@ -297,9 +309,23 @@ contract BatchingHookTest is BaseTest {
         uint256 comp0 = currency0.balanceOf(caller) - callerEthBefore;
         uint256 comp1 = currency1.balanceOf(caller) - callerTok1Before;
 
-        assertEq(comp0, halfEth, "wrong token0 compensation");
-        assertEq(comp1, halfEth, "wrong token1 compensation");
-        assertEq(comp0, comp1,   "compensation not equal from both sides");
+        assertEq(comp0, expectedComp0, "wrong token0 compensation");
+        assertEq(comp1, expectedComp1, "wrong token1 compensation");
+
+        // At 1:1 every trader's shortfall from a fee-free 1:1 fill is the value they
+        // contributed to the rebate.  zeroForOne traders are paid from token1 that is
+        // never swapped, so their share is exact (within rounding).
+        for (uint256 i = 0; i < zfoTraders.length; i++) {
+            uint256 shortfall = zfoAmountIn - currency1.balanceOf(zfoTraders[i]);
+            assertApproxEqAbs(shortfall, expectedPerTrader, 1, "zeroForOne trader paid uneven compensation");
+        }
+
+        // oneForZero traders additionally absorb the pool fee on the small balancing swap
+        // created by the uneven rebate, so allow a 0.5% tolerance.
+        for (uint256 i = 0; i < ofzTraders.length; i++) {
+            uint256 shortfall = ofzAmountIn - currency0.balanceOf(ofzTraders[i]);
+            assertApproxEqRel(shortfall, expectedPerTrader, 0.005e18, "oneForZero trader paid uneven compensation");
+        }
 
         vm.revertToState(snapBefore);
     }
@@ -573,14 +599,15 @@ contract BatchingHookTest is BaseTest {
         hook.allowRegularSwap();
         _swapWithLimit(token0TraderA, amountToken0A, true, TickMath.MIN_SQRT_PRICE + 1);
         _swapWithLimit(token0TraderB, amountToken0B, true, TickMath.MIN_SQRT_PRICE + 1);
-        uint256 token0OutSeqA = currency0.balanceOf(token1TraderA);
-        uint256 token0OutSeqB = currency0.balanceOf(token1TraderB);
-        vm.revertToState(snap);
-
-        _swapWithLimit(token1TraderA, amountToken1A, false, TickMath.MAX_SQRT_PRICE - 1);
-        _swapWithLimit(token1TraderB, amountToken1B, false, TickMath.MAX_SQRT_PRICE - 1);
         uint256 token1OutSeqA = currency1.balanceOf(token0TraderA);
         uint256 token1OutSeqB = currency1.balanceOf(token0TraderB);
+        vm.revertToState(snap);
+
+        hook.allowRegularSwap();
+        _swapWithLimit(token1TraderA, amountToken1A, false, TickMath.MAX_SQRT_PRICE - 1);
+        _swapWithLimit(token1TraderB, amountToken1B, false, TickMath.MAX_SQRT_PRICE - 1);
+        uint256 token0OutSeqA = currency0.balanceOf(token1TraderA);
+        uint256 token0OutSeqB = currency0.balanceOf(token1TraderB);
         vm.revertToState(snap);
         hook.disallowRegularSwap();
 
@@ -600,6 +627,52 @@ contract BatchingHookTest is BaseTest {
         vm.revertToState(snapBefore);
     }
 
+    /// @notice compares batch-clearing output against sequential AMM swaps for two traders
+    ///         swapping in the same direction, so the batch has no opposing flow to net against;
+    ///         the batch must do worse than sequential execution, but by no more than the
+    ///         caller's compensation
+    /// @param amountA input amount for trader A
+    /// @param amountB input amount for trader B
+    /// @param zeroForOne true if both traders swap currency0 for currency1
+    function OutputBatVsSeqOneDirection(uint256 amountA, uint256 amountB, bool zeroForOne) internal {
+        uint256 snapBefore = vm.snapshotState();
+        address traderA = address(0xA11DCE);
+        address traderB = address(0xBD0B);
+        Currency output = zeroForOne ? currency1 : currency0;
+        uint160 limit = zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+
+        hook.allowRegularSwap();
+        _swapWithLimit(traderA, amountA, zeroForOne, limit);
+        _swapWithLimit(traderB, amountB, zeroForOne, limit);
+        uint256 outSeq = output.balanceOf(traderA) + output.balanceOf(traderB);
+        vm.revertToState(snapBefore);
+
+        // Set a known gas environment after the revert, which restores the block basefee.
+        // gasPrice(15 gwei) < 2xbaseFee(20 gwei) so the basefee cap does not activate.
+        vm.fee(10 gwei);
+        vm.txGasPrice(15 gwei);
+
+        _swapWithLimit(traderA, amountA, zeroForOne, limit);
+        _swapWithLimit(traderB, amountB, zeroForOne, limit);
+        assertTrue(hook.clearBatchNoInterval(key), "one-direction batch should clear");
+        uint256 outBat = output.balanceOf(traderA) + output.balanceOf(traderB);
+
+        // n=2, all on one side, so the whole rebate comes from the input token, capped at the
+        // batch input.  At SQRT_PRICE_1_1 price=1 so its value in the output token is the same.
+        uint256 n = 2;
+        uint256 comp = (286049 + 42135 * n) * 15 gwei * 11 / 10;
+        if (comp > amountA + amountB) comp = amountA + amountB;
+
+        // the batch swaps amountA + amountB - comp in one pool swap, so traders receive less
+        // than sequential execution, but the comp units would have been swapped last at a
+        // worse-than-start price, so the shortfall is at most comp (plus pro-rata rounding)
+        assertLt(outBat, outSeq, "one-direction batch should pay for caller compensation");
+        assertLe(outSeq - outBat, comp + 2, "one-direction batch shortfall exceeds caller compensation");
+
+        vm.revertToState(snapBefore);
+        vm.txGasPrice(0);
+    }
+
     /// @notice fuzz test that confirms the batch output guarantee holds across random input amounts;
     ///         amounts are re-derived each iteration via modulo to avoid bound() overhead
     function test_outputGuar(
@@ -614,6 +687,8 @@ contract BatchingHookTest is BaseTest {
             amountToken1A = 1e11 + amountToken1A % (2e19 - 1e11);
             amountToken1B = 1e11 + amountToken1B % (2e19 - 1e11);
             OutputBatVsSeq(amountToken0A, amountToken0B, amountToken1A, amountToken1B);
+            OutputBatVsSeqOneDirection(amountToken0A, amountToken0B, true);
+            OutputBatVsSeqOneDirection(amountToken1A, amountToken1B, false);
         }
     }
 
