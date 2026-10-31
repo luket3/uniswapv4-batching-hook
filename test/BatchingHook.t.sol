@@ -363,6 +363,60 @@ contract BatchingHookTest is BaseTest {
         vm.revertToState(snapBefore);
     }
 
+    /// @notice verifies that a batch can clear mid-block and that swaps submitted later in the
+    ///         same block are queued into a fresh batch, which can then also clear in that block
+    function test_clearBatch_sameBlock() public {
+        uint256 snapBefore = vm.snapshotState();
+        uint256 startBlock = block.number;
+
+        address[5] memory batch1Traders = [address(0xA1), address(0xA2), address(0xA3), address(0xA4), address(0xA5)];
+        address[5] memory batch2Traders = [address(0xB1), address(0xB2), address(0xB3), address(0xB4), address(0xB5)];
+        bool[5] memory directions = [true, false, true, false, true];
+
+        // first batch: queue MIN_BATCH_SIZE swaps and clear
+        for (uint256 i = 0; i < batch1Traders.length; i++) {
+            uint160 limit = directions[i] ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+            _swapWithLimit(batch1Traders[i], 1e17, directions[i], limit);
+        }
+        assertTrue(hook.clearBatch(key), "first batch should clear");
+        assertTrue(hook.cleared(1), "first batch id should be marked cleared");
+
+        uint256[5] memory batch1Outputs;
+        for (uint256 i = 0; i < batch1Traders.length; i++) {
+            Currency out = directions[i] ? currency1 : currency0;
+            batch1Outputs[i] = out.balanceOf(batch1Traders[i]);
+            assertGt(batch1Outputs[i], 0, "first batch trader received no output");
+        }
+
+        // second batch: queue swaps in the same block, they must be held rather than filled
+        (uint160 sqrtPriceAfterFirst,,,) = poolManager.getSlot0(poolId);
+        for (uint256 i = 0; i < batch2Traders.length; i++) {
+            uint160 limit = directions[i] ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+            _swapWithLimit(batch2Traders[i], 1e17, directions[i], limit);
+            Currency out = directions[i] ? currency1 : currency0;
+            assertEq(out.balanceOf(batch2Traders[i]), 0, "second batch output paid before clearing");
+        }
+        (uint160 sqrtPriceQueued,,,) = poolManager.getSlot0(poolId);
+        assertEq(sqrtPriceQueued, sqrtPriceAfterFirst, "queueing second batch must not move price");
+
+        // the second batch starts from the price the first batch left behind
+        (,, uint160 sqrtStartPriceX96,,) = hook.batchStates(poolId);
+        assertEq(sqrtStartPriceX96, sqrtPriceAfterFirst, "second batch should start at post-clear price");
+
+        assertTrue(hook.clearBatch(key), "second batch should clear");
+        assertTrue(hook.cleared(2), "second batch id should be marked cleared");
+        assertEq(block.number, startBlock, "both batches should clear within the same block");
+
+        for (uint256 i = 0; i < batch2Traders.length; i++) {
+            Currency out = directions[i] ? currency1 : currency0;
+            assertGt(out.balanceOf(batch2Traders[i]), 0, "second batch trader received no output");
+            // clearing the second batch must not pay anything more to first batch traders
+            assertEq(out.balanceOf(batch1Traders[i]), batch1Outputs[i], "first batch trader paid twice");
+        }
+
+        vm.revertToState(snapBefore);
+    }
+
     // -- Permutation test helpers --
 
     /// @notice returns a deep copy of arr
